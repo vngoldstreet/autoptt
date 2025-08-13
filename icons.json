@@ -1,0 +1,15 @@
+[
+  {
+    "name": "hs",
+    "file": ["icons/hs_1.png", "icons/hs_2.png"]
+  },
+  {
+    "name": "ptt",
+    "file": [
+      "icons/ptt.png",
+      "icons/danhsach.png",
+      "icons/close.png",
+      "icons/close2.png"
+    ]
+  }
+]

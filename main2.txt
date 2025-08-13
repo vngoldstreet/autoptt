@@ -1,0 +1,301 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/go-vgo/robotgo"
+)
+
+/* ====== Cấu hình chung ====== */
+
+// ROI: vùng cần quét (tối ưu tốc độ)
+const (
+	ROI_X = 0
+	ROI_Y = 0
+	ROI_W = 730
+	ROI_H = 1080
+)
+
+// Chu kỳ quét
+const (
+	INTERVAL_SEC  = 2
+	CLICK_HOLD_MS = 70 // thời gian giữ chuột
+)
+
+// So khớp ảnh
+const (
+	TOLERANCE   = 16 // sai khác màu/ kênh, 0..255
+	SCAN_STEP   = 1  // bước quét thô (1 = chính xác nhất)
+	SAMPLE_STEP = 2  // bước xác minh (2-3 nhanh hơn, 1 chính xác tuyệt đối)
+)
+
+/* ====== Kiểu dữ liệu cấu hình ====== */
+
+type ActionCfg struct {
+	Type    string   `json:"type"`               // "click" | "double_click" | "keytap"
+	HoldMS  int      `json:"hold_ms,omitempty"`  // cho click
+	AfterMS int      `json:"after_ms,omitempty"` // delay sau action
+	Key     string   `json:"key,omitempty"`      // cho keytap
+	Mods    []string `json:"mods,omitempty"`     // ví dụ ["command"], ["ctrl","shift"]
+}
+
+type IconCfg struct {
+	Name        string    `json:"name"`
+	File        string    `json:"file"`
+	OffsetX     int       `json:"offset_x"`
+	OffsetY     int       `json:"offset_y"`
+	Action      ActionCfg `json:"action"`
+	CooldownSec int       `json:"cooldown_sec"`
+	// runtime
+	img image.Image     `json:"-"`
+	box image.Rectangle `json:"-"`
+	lut [][2]int        `json:"-"`
+}
+
+func loadIconsConfig(path string) ([]*IconCfg, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var icons []*IconCfg
+	if err := json.NewDecoder(f).Decode(&icons); err != nil {
+		return nil, err
+	}
+	// nạp ảnh
+	for _, ic := range icons {
+		img, err := loadPNG(ic.File)
+		if err != nil {
+			return nil, fmt.Errorf("load %s: %w", ic.File, err)
+		}
+		ic.img = img
+		ic.box = img.Bounds()
+		// chuẩn bị anchor LUT (góc + tâm) để lọc nhanh
+		tw, th := ic.box.Dx(), ic.box.Dy()
+		anchors := [][2]int{{0, 0}, {tw - 1, 0}, {0, th - 1}, {tw - 1, th - 1}}
+		if tw >= 5 && th >= 5 {
+			anchors = append(anchors, [2]int{tw / 2, th / 2})
+		}
+		ic.lut = anchors
+	}
+	return icons, nil
+}
+
+/* ====== Tiện ích ảnh ====== */
+
+func loadPNG(path string) (image.Image, error) {
+	f, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return png.Decode(f)
+}
+
+func almostEqual(c1, c2 color.Color, tol int) bool {
+	r1, g1, b1, a1 := c1.RGBA()
+	r2, g2, b2, a2 := c2.RGBA()
+	scale := uint32(257) // 255*257 ≈ 65535
+	return absU(r1, r2) <= uint32(tol)*scale &&
+		absU(g1, g2) <= uint32(tol)*scale &&
+		absU(b1, b2) <= uint32(tol)*scale &&
+		absU(a1, a2) <= uint32(tol)*scale
+}
+
+func absU(a, b uint32) uint32 {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+/* ====== Tìm sub-image nhanh trong một ROI ====== */
+
+func findSubImageFast(screen image.Image, target image.Image, tolerance int, scanStep, sampleStep int, anchors [][2]int) (int, int, bool) {
+	sb := screen.Bounds()
+	tb := target.Bounds()
+	sw, sh := sb.Dx(), sb.Dy()
+	tw, th := tb.Dx(), tb.Dy()
+	if tw == 0 || th == 0 || sw < tw || sh < th {
+		return -1, -1, false
+	}
+
+	for y := 0; y <= sh-th; y += max(1, scanStep) {
+		for x := 0; x <= sw-tw; x += max(1, scanStep) {
+			// pixel gốc nhanh
+			if !almostEqual(screen.At(sb.Min.X+x, sb.Min.Y+y), target.At(tb.Min.X, tb.Min.Y), tolerance) {
+				continue
+			}
+			// anchors
+			ok := true
+			for _, a := range anchors {
+				ax, ay := a[0], a[1]
+				if !almostEqual(
+					screen.At(sb.Min.X+x+ax, sb.Min.Y+y+ay),
+					target.At(tb.Min.X+ax, tb.Min.Y+ay),
+					tolerance,
+				) {
+					ok = false
+					break
+				}
+			}
+			if !ok {
+				continue
+			}
+			// xác minh mẫu
+			if verifySample(screen, target, x, y, tolerance, sampleStep) {
+				return x, y, true
+			}
+		}
+	}
+	return -1, -1, false
+}
+
+func verifySample(screen image.Image, target image.Image, offX, offY int, tol, step int) bool {
+	sb := screen.Bounds()
+	tb := target.Bounds()
+	tw, th := tb.Dx(), tb.Dy()
+	for ty := 0; ty < th; ty += max(1, step) {
+		for tx := 0; tx < tw; tx += max(1, step) {
+			if !almostEqual(
+				screen.At(sb.Min.X+offX+tx, sb.Min.Y+offY+ty),
+				target.At(tb.Min.X+tx, tb.Min.Y+ty),
+				tol,
+			) {
+				return false
+			}
+		}
+	}
+	// kiểm biên khi step>1
+	if step > 1 {
+		for tx := 0; tx < tw; tx += step {
+			if !almostEqual(
+				screen.At(sb.Min.X+offX+tx, sb.Min.Y+offY+th-1),
+				target.At(tb.Min.X+tx, tb.Min.Y+th-1),
+				tol,
+			) {
+				return false
+			}
+		}
+		for ty := 0; ty < th; ty += step {
+			if !almostEqual(
+				screen.At(sb.Min.X+offX+tw-1, sb.Min.Y+offY+ty),
+				target.At(tb.Min.X+tw-1, tb.Min.Y+ty),
+				tol,
+			) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+/* ====== Thực thi action ====== */
+
+func performAction(act ActionCfg, centerX, centerY int) {
+	robotgo.MouseSleep = CLICK_HOLD_MS
+	switch act.Type {
+	case "click":
+		robotgo.Move(centerX, centerY)
+		robotgo.Click("left", true)
+	case "double_click":
+		robotgo.Move(centerX, centerY)
+		// click 1
+		robotgo.Click("left", true)
+		time.Sleep(40 * time.Millisecond) // nhịp đôi ngắn
+		// click 2
+		robotgo.Click("left", true)
+		time.Sleep(40 * time.Millisecond) // nhịp đôi ngắn
+	case "auto_click":
+		running := false
+		start := time.Now()
+		for running && time.Since(start) < 5*time.Second {
+			robotgo.Click("left", true)
+		}
+		running = false
+		fmt.Println("Auto click kết thúc")
+	default:
+		running := false
+		start := time.Now()
+		for running && time.Since(start) < 5*time.Second {
+			robotgo.Click("left", true)
+		}
+		running = false
+		fmt.Println("Auto click kết thúc")
+	}
+	if act.AfterMS > 0 {
+		time.Sleep(time.Duration(act.AfterMS) * time.Millisecond)
+	}
+}
+
+/* ====== Main loop ====== */
+
+func main() {
+	icons, err := loadIconsConfig("icons.json")
+	if err != nil {
+		fmt.Println("Lỗi đọc icons.json:", err)
+		return
+	}
+	// cooldown tracker
+	lastExec := make(map[string]time.Time)
+
+	fmt.Printf("Bắt đầu quét ROI (%d,%d,%d,%d) mỗi %ds…\n", ROI_X, ROI_Y, ROI_W, ROI_H, INTERVAL_SEC)
+
+	for {
+		start := time.Now()
+
+		img, err := robotgo.CaptureImg(ROI_X, ROI_Y, ROI_W, ROI_H)
+		if err != nil {
+			fmt.Println("CaptureImg error:", err)
+			time.Sleep(INTERVAL_SEC * time.Second)
+			continue
+		}
+
+		// duyệt icon theo thứ tự trong file (ưu tiên trước)
+		for _, ic := range icons {
+			// cooldown
+			if cd := ic.CooldownSec; cd > 0 {
+				if t, ok := lastExec[ic.Name]; ok && time.Since(t) < time.Duration(cd)*time.Second {
+					continue
+				}
+			}
+
+			rx, ry, ok := findSubImageFast(img, ic.img, TOLERANCE, SCAN_STEP, SAMPLE_STEP, ic.lut)
+			if !ok {
+				continue
+			}
+
+			// tâm tuyệt đối
+			cx := ROI_X + rx + ic.box.Dx()/2 + ic.OffsetX
+			cy := ROI_Y + ry + ic.box.Dy()/2 + ic.OffsetY
+
+			fmt.Printf("[HIT] %s @ ROI(%d,%d) ABS(%d,%d)\n", ic.Name, rx, ry, cx, cy)
+			performAction(ic.Action, cx, cy)
+			lastExec[ic.Name] = time.Now()
+		}
+
+		elapsed := time.Since(start)
+		// ngủ cho đủ chu kỳ
+		sleep := time.Duration(INTERVAL_SEC)*time.Second - elapsed
+		if sleep < 50*time.Millisecond {
+			sleep = 50 * time.Millisecond
+		}
+		time.Sleep(sleep)
+	}
+}
+
+/* ====== Helpers ====== */
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
