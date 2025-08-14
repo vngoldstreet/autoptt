@@ -27,11 +27,11 @@ const (
 	REGION_W = 730
 	REGION_H = 1080
 
-	TOLERANCE   = 16 // sai số màu cho so khớp
+	TOLERANCE   = 22 // sai số màu cho so khớp
 	SCAN_STEP   = 1
 	SAMPLE_STEP = 2
 
-	INTERVAL_SEC  = 1  // số giây giữa mỗi lần quét
+	INTERVAL_SEC  = 30 // số giây giữa mỗi lần quét
 	CLICK_HOLD_MS = 70 // thời gian giữ chuột
 )
 
@@ -153,7 +153,7 @@ func main() {
 		case "exit", "quit", "q":
 			fmt.Println("Bye!")
 			return
-		case "starths":
+		case "autohs":
 			fmt.Println("\nBắt đầu quét màn hình")
 			icons, err := LoadIconsConfig("icons.json")
 			if err != nil {
@@ -221,7 +221,7 @@ func main() {
 				time.Sleep(INTERVAL_SEC * time.Second)
 
 			}
-		case "startptt":
+		case "autoptt":
 			fmt.Println("\nBắt đầu làm PTT")
 			icons, err := LoadIconsConfig("icons.json")
 			if err != nil {
@@ -256,7 +256,6 @@ func main() {
 			for {
 				// 1) Chụp đúng ROI thay vì full màn hình
 				for _, t := range targets {
-					fmt.Printf("t.name: %v\n", t.name)
 					startT := time.Now()
 					img, err := robotgo.CaptureImg(REGION_X, REGION_Y, REGION_W, REGION_H)
 					if err != nil {
@@ -311,7 +310,8 @@ func printHelp() {
 	save [ten]    - chụp và lưu vào icons
 	help          - hiện hướng dẫn
 	exit          - thoát
-	start         - auto shake hands`)
+	autohs        - auto shake hands
+	autoptt       - auto làm ptt`)
 }
 
 /* ==========================
