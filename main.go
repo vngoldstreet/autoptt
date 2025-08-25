@@ -218,8 +218,7 @@ func main() {
 					matched = true
 					break // ưu tiên icon theo thứ tự: dừng ở icon đầu tiên trúng
 				}
-				time.Sleep(INTERVAL_SEC * time.Second)
-
+				time.Sleep(1 * time.Second)
 			}
 		case "autoptt":
 			fmt.Println("\nBắt đầu làm PTT")
